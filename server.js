@@ -5,12 +5,14 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "10mb" }));
 
+const BUILD_MARKER = "SERVER_BUILD_2026_04_07_V4";
+
 const PORT = Number(process.env.PORT || 10000);
 const HOST = process.env.HOST || "0.0.0.0";
 const API_KEY = process.env.API_KEY || "";
-const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TIMEOUT_MS || 120000);
-const DEFAULT_WAIT_FOR_NETWORK_IDLE_MS = Number(process.env.DEFAULT_WAIT_FOR_NETWORK_IDLE_MS || 1500);
-const DEFAULT_WAIT_FOR_DOM_STABLE_MS = Number(process.env.DEFAULT_WAIT_FOR_DOM_STABLE_MS || 1500);
+const DEFAULT_TIMEOUT_MS = Number(process.env.DEFAULT_TIMEOUT_MS || 180000);
+const DEFAULT_WAIT_FOR_NETWORK_IDLE_MS = Number(process.env.DEFAULT_WAIT_FOR_NETWORK_IDLE_MS || 3000);
+const DEFAULT_WAIT_FOR_DOM_STABLE_MS = Number(process.env.DEFAULT_WAIT_FOR_DOM_STABLE_MS || 4000);
 const DEFAULT_VIEWPORT_WIDTH = Number(process.env.DEFAULT_VIEWPORT_WIDTH || 1440);
 const DEFAULT_VIEWPORT_HEIGHT = Number(process.env.DEFAULT_VIEWPORT_HEIGHT || 2200);
 const LOG_BROWSER_CONSOLE = (process.env.LOG_BROWSER_CONSOLE || "true").toLowerCase() === "true";
@@ -32,7 +34,7 @@ function assertAuthorized(req, res) {
   if (!API_KEY) return true;
   const incoming = req.header("x-api-key");
   if (!incoming || incoming !== API_KEY) {
-    res.status(401).json({ success: false, message: "Unauthorized" });
+    res.status(401).json({ success: false, message: "Unauthorized", build: BUILD_MARKER });
     return false;
   }
   return true;
@@ -68,23 +70,27 @@ async function installTracking(page) {
       xhrInstalled: false
     };
 
+    function touch() {
+      window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+    }
+
     function ensureMutationObserver() {
       if (window.__CYRIL_RENDERER__.mutationObserverInstalled) return;
       window.__CYRIL_RENDERER__.mutationObserverInstalled = true;
 
+      const target = document.documentElement || document;
+      if (!target) return;
+
       const observer = new MutationObserver(() => {
-        window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+        touch();
       });
 
-      const target = document.documentElement || document;
-      if (target) {
-        observer.observe(target, {
-          childList: true,
-          subtree: true,
-          attributes: true,
-          characterData: true
-        });
-      }
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true
+      });
     }
 
     function ensureFetchWrap() {
@@ -94,12 +100,12 @@ async function installTracking(page) {
       const originalFetch = window.fetch.bind(window);
       window.fetch = async (...args) => {
         window.__CYRIL_RENDERER__.fetchCount++;
-        window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+        touch();
         try {
           return await originalFetch(...args);
         } finally {
           window.__CYRIL_RENDERER__.fetchCount--;
-          window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+          touch();
         }
       };
     }
@@ -119,13 +125,13 @@ async function installTracking(page) {
       XMLHttpRequest.prototype.send = function (...args) {
         if (this.__cyrilTracked) {
           window.__CYRIL_RENDERER__.xhrCount++;
-          window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+          touch();
 
           this.addEventListener(
             "loadend",
             () => {
               window.__CYRIL_RENDERER__.xhrCount--;
-              window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+              touch();
             },
             { once: true }
           );
@@ -137,6 +143,7 @@ async function installTracking(page) {
     ensureMutationObserver();
     ensureFetchWrap();
     ensureXhrWrap();
+    touch();
   });
 }
 
@@ -157,7 +164,6 @@ async function getReadyDiagnostics(page) {
     return await page.evaluate(() => {
       const rendererState = window.__CYRIL_RENDERER__ || {};
       return {
-        mode: null,
         readyFlag: window.CYRIL_PDF_READY === true,
         bodyReadyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
         pending:
@@ -172,7 +178,6 @@ async function getReadyDiagnostics(page) {
     });
   } catch (e) {
     return {
-      mode: null,
       readyFlag: false,
       bodyReadyAttr: null,
       pending: null,
@@ -201,6 +206,7 @@ async function waitForAppToBeReady(page, options) {
   );
   const preferAppReadyFlag = toBoolean(options.preferAppReadyFlag, true);
 
+  log("[waitForAppToBeReady] build =", BUILD_MARKER);
   log("[waitForAppToBeReady] timeoutMs =", timeoutMs);
   log("[waitForAppToBeReady] networkIdleMs =", networkIdleMs);
   log("[waitForAppToBeReady] domStableMs =", domStableMs);
@@ -226,13 +232,14 @@ async function waitForAppToBeReady(page, options) {
         () => {
           return window.CYRIL_PDF_READY === true;
         },
-        { timeout: Math.min(timeoutMs, 120000) }
+        { timeout: timeoutMs }
       );
 
       await sleep(networkIdleMs);
 
       const diagnostics = await getReadyDiagnostics(page);
       diagnostics.mode = "appReadyFlag";
+      diagnostics.build = BUILD_MARKER;
       log("[waitForAppToBeReady] appReadyFlag diagnostics", JSON.stringify(diagnostics));
       return diagnostics;
     } catch (e) {
@@ -277,15 +284,26 @@ async function waitForAppToBeReady(page, options) {
 
   const diagnostics = await getReadyDiagnostics(page);
   diagnostics.mode = "heuristic";
+  diagnostics.build = BUILD_MARKER;
   log("[waitForAppToBeReady] heuristic diagnostics", JSON.stringify(diagnostics));
   return diagnostics;
 }
+
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "CYRIL PDF Renderer is running",
+    service: "cyril-pdf-renderer",
+    build: BUILD_MARKER
+  });
+});
 
 app.get("/health", (req, res) => {
   res.json({
     success: true,
     message: "OK",
-    service: "cyril-pdf-renderer"
+    service: "cyril-pdf-renderer",
+    build: BUILD_MARKER
   });
 });
 
@@ -296,7 +314,11 @@ app.post("/render", async (req, res) => {
   const targetUrl = body.url;
 
   if (!targetUrl || typeof targetUrl !== "string") {
-    return res.status(400).json({ success: false, message: "Missing url" });
+    return res.status(400).json({
+      success: false,
+      message: "Missing url",
+      build: BUILD_MARKER
+    });
   }
 
   let browser;
@@ -311,6 +333,7 @@ app.post("/render", async (req, res) => {
       log(
         "/render request",
         JSON.stringify({
+          build: BUILD_MARKER,
           url: targetUrl,
           format: body.format || "A4",
           landscape: !!body.landscape,
@@ -388,6 +411,7 @@ app.post("/render", async (req, res) => {
     return res.json({
       success: true,
       message: "Rendered successfully",
+      build: BUILD_MARKER,
       pdfBase64: pdfBuffer.toString("base64"),
       pageCount: null,
       waitMode: waitResult ? waitResult.mode : null,
@@ -397,7 +421,8 @@ app.post("/render", async (req, res) => {
     errorLog("[render error]", e && e.stack ? e.stack : String(e));
     return res.status(500).json({
       success: false,
-      message: e && e.message ? e.message : String(e)
+      message: e && e.message ? e.message : String(e),
+      build: BUILD_MARKER
     });
   } finally {
     try {
@@ -413,5 +438,5 @@ app.post("/render", async (req, res) => {
 });
 
 app.listen(PORT, HOST, () => {
-  log(`CYRIL PDF Renderer listening on http://${HOST}:${PORT}`);
+  log(`CYRIL PDF Renderer listening on http://${HOST}:${PORT} build=${BUILD_MARKER}`);
 });
