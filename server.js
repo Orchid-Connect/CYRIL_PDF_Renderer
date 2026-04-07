@@ -168,12 +168,29 @@ async function waitForAppToBeReady(page, options) {
   if (preferAppReadyFlag) {
     try {
       console.log("[waitForAppToBeReady] waiting for window.CYRIL_PDF_READY === true");
+
       await page.waitForFunction(
-        () => window.CYRIL_PDF_READY === true,
-        { timeout: 20000 }
+        () => {
+          return window.CYRIL_PDF_READY === true;
+        },
+        { timeout: Math.min(timeoutMs, 120000) }
       );
+
       console.log("[waitForAppToBeReady] CYRIL_PDF_READY detected");
-      return;
+
+      const readyState = await page.evaluate(() => {
+        return {
+          mode: "appReadyFlag",
+          ready: window.CYRIL_PDF_READY === true,
+          bodyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
+          pending: window.CYRIL_PDF_TRACKER && window.CYRIL_PDF_TRACKER.getPending
+            ? window.CYRIL_PDF_TRACKER.getPending()
+            : null
+        };
+      });
+
+      console.log("[waitForAppToBeReady] ready state", JSON.stringify(readyState));
+      return readyState;
     } catch (e) {
       console.log("[waitForAppToBeReady] CYRIL_PDF_READY not detected, falling back to heuristic wait");
     }
@@ -211,6 +228,20 @@ async function waitForAppToBeReady(page, options) {
 
   console.log("[waitForAppToBeReady] heuristic wait complete");
   await sleep(networkIdleMs);
+
+  const readyState = await page.evaluate(() => {
+    return {
+      mode: "heuristic",
+      ready: window.CYRIL_PDF_READY === true,
+      bodyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
+      pending: window.CYRIL_PDF_TRACKER && window.CYRIL_PDF_TRACKER.getPending
+        ? window.CYRIL_PDF_TRACKER.getPending()
+        : null
+    };
+  });
+
+  console.log("[waitForAppToBeReady] ready state", JSON.stringify(readyState));
+  return readyState;
 }
 
 app.get("/health", (req, res) => {
