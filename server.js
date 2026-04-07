@@ -4,7 +4,7 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const BUILD = "SERVER_BUILD_2026_04_07_TRACE_3";
+const BUILD = "SERVER_BUILD_2026_04_07_TRACE_4";
 const PORT = process.env.PORT || 10000;
 
 function log(...args) {
@@ -77,8 +77,17 @@ async function getDiagnostics(page) {
   try {
     return await page.evaluate(() => {
       const r = window.__CYRIL_RENDERER__ || {};
+      const tracker = window.CYRIL_PDF_TRACKER || {};
+      const pending = Array.isArray(tracker.pending)
+        ? tracker.pending
+        : Array.isArray(tracker._pending)
+        ? tracker._pending
+        : [];
+
       return {
         readyFlag: window.CYRIL_PDF_READY === true,
+        trackerReady: tracker.ready === true,
+        trackerPendingCount: pending.length,
         fetchCount: r.fetchCount || 0,
         xhrCount: r.xhrCount || 0,
         lastMutationAt: r.lastMutationAt || null,
@@ -93,21 +102,12 @@ async function getDiagnostics(page) {
   }
 }
 
-/**
- * New wait strategy:
- * 1) If preferAppReadyFlag=true, wait briefly for explicit window.CYRIL_PDF_READY=true
- * 2) If not found, fall back to a simple fixed delay
- *
- * We intentionally avoid “smart” DOM-stable heuristics because they are what keep timing out.
- */
 async function waitForReady(page, options) {
   const totalTimeoutMs = options.timeoutMs || 120000;
-  const fallbackDelayMs = options.waitForDomStableMs || 4000;
+  const fallbackDelayMs = options.waitForDomStableMs || 3000;
   const preferFlag = options.preferAppReadyFlag === true;
-
-  // Cap the explicit-flag wait so we never burn the whole request on it.
-  const flagWaitMs = Math.min(
-    Math.max(options.flagWaitMs || 12000, 1000),
+  const signalWaitMs = Math.min(
+    Math.max(options.flagWaitMs || 15000, 1000),
     totalTimeoutMs
   );
 
@@ -115,20 +115,42 @@ async function waitForReady(page, options) {
     totalTimeoutMs,
     fallbackDelayMs,
     preferFlag,
-    flagWaitMs
+    signalWaitMs
   }));
 
   if (preferFlag) {
     try {
-      log("waitForReady:waiting-for-flag");
+      log("waitForReady:waiting-for-ready-signal");
+
       await page.waitForFunction(
-        () => window.CYRIL_PDF_READY === true,
-        { timeout: flagWaitMs }
+        () => {
+          const winFlag = window.CYRIL_PDF_READY === true;
+
+          const bodyAttr =
+            document.body &&
+            document.body.getAttribute("data-cyril-pdf-ready") === "true";
+
+          const tracker = window.CYRIL_PDF_TRACKER || {};
+          const pending = Array.isArray(tracker.pending)
+            ? tracker.pending
+            : Array.isArray(tracker._pending)
+            ? tracker._pending
+            : [];
+
+          const trackerReady =
+            tracker.ready === true && pending.length === 0;
+
+          return winFlag || bodyAttr || trackerReady;
+        },
+        {},
+        { timeout: signalWaitMs }
       );
-      log("waitForReady:flag-detected");
-      return { mode: "flag" };
+
+      const matchedDiagnostics = await getDiagnostics(page);
+      log("waitForReady:ready-signal-detected", JSON.stringify(matchedDiagnostics));
+      return { mode: "ready-signal" };
     } catch (e) {
-      log("waitForReady:flag-not-detected", e.message);
+      log("waitForReady:ready-signal-not-detected", e.message);
     }
   }
 
@@ -163,8 +185,8 @@ app.post("/render", async (req, res) => {
       landscape: body.landscape || false,
       printBackground: body.printBackground !== false,
       preferAppReadyFlag: body.preferAppReadyFlag === true,
-      waitForDomStableMs: body.waitForDomStableMs || 4000,
-      flagWaitMs: body.flagWaitMs || 12000
+      waitForDomStableMs: body.waitForDomStableMs || 3000,
+      flagWaitMs: body.flagWaitMs || 15000
     }));
 
     log("render:launching-browser");
@@ -196,9 +218,14 @@ app.post("/render", async (req, res) => {
       log("browser:pageerror", err.message);
     });
 
+    // LOG ONLY. Do not fail render because of CSP/CORS/network noise.
     page.on("requestfailed", request => {
       const failure = request.failure();
-      log("browser:requestfailed", request.url(), failure ? failure.errorText : "unknown");
+      log(
+        "browser:requestfailed",
+        request.url(),
+        failure ? failure.errorText : "unknown"
+      );
     });
 
     log("render:install-tracking");
