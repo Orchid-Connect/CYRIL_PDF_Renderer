@@ -1,0 +1,17 @@
+{
+  "name": "cyril-pdf-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Playwright PDF renderer for Salesforce Experience Cloud pages",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.52.0"
+  }
+}
