@@ -139,56 +139,78 @@ async function waitForFonts(page) {
 }
 
 async function waitForAppToBeReady(page, options) {
-  const timeoutMs = getSafeNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS, 1000, 300000);
-  const networkIdleMs = getSafeNumber(options.waitForNetworkIdleMs, DEFAULT_WAIT_FOR_NETWORK_IDLE_MS, 0, 10000);
-  const domStableMs = getSafeNumber(options.waitForDomStableMs, DEFAULT_WAIT_FOR_DOM_STABLE_MS, 0, 10000);
-  const preferAppReadyFlag = toBoolean(options.preferAppReadyFlag, true);
+  const timeoutMs = Number(options.timeoutMs || 120000);
+  const networkIdleMs = Number(options.waitForNetworkIdleMs || 1500);
+  const domStableMs = Number(options.waitForDomStableMs || 1500);
+  const preferAppReadyFlag = options.preferAppReadyFlag === true;
+
+  console.log("[waitForAppToBeReady] timeoutMs =", timeoutMs);
+  console.log("[waitForAppToBeReady] preferAppReadyFlag =", preferAppReadyFlag);
 
   await page.waitForLoadState("domcontentloaded", { timeout: timeoutMs });
   await page.waitForLoadState("load", { timeout: timeoutMs });
 
   try {
     await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 30000) });
+    console.log("[waitForAppToBeReady] networkidle reached");
   } catch (e) {
-    // some apps never reach strict networkidle
+    console.log("[waitForAppToBeReady] networkidle not reached, continuing");
   }
 
-  await waitForFonts(page);
+  await page.evaluate(async () => {
+    if (document.fonts && document.fonts.ready) {
+      try {
+        await document.fonts.ready;
+      } catch (e) {}
+    }
+  });
 
   if (preferAppReadyFlag) {
     try {
-      await page.waitForFunction(() => window.CYRIL_PDF_READY === true, { timeout: 15000 });
-      await sleep(networkIdleMs);
-      return { mode: "explicit-flag" };
+      console.log("[waitForAppToBeReady] waiting for window.CYRIL_PDF_READY === true");
+      await page.waitForFunction(
+        () => window.CYRIL_PDF_READY === true,
+        { timeout: 20000 }
+      );
+      console.log("[waitForAppToBeReady] CYRIL_PDF_READY detected");
+      return;
     } catch (e) {
-      // fallback to heuristic mode
+      console.log("[waitForAppToBeReady] CYRIL_PDF_READY not detected, falling back to heuristic wait");
     }
   }
 
   await page.waitForFunction(
     ({ domStableMs }) => {
-      const state = window.__CYRIL_RENDERER__ || {
-        fetchCount: 0,
-        xhrCount: 0,
-        lastMutationAt: Date.now()
-      };
+      if (!window.__CYRIL_PDF_STATE__) {
+        window.__CYRIL_PDF_STATE__ = {
+          lastHtml: "",
+          lastChangeAt: Date.now()
+        };
+      }
+
+      const state = window.__CYRIL_PDF_STATE__;
+      const bodyHtml = document.body ? document.body.innerHTML : "";
+
+      if (bodyHtml !== state.lastHtml) {
+        state.lastHtml = bodyHtml;
+        state.lastChangeAt = Date.now();
+      }
 
       const now = Date.now();
-      const domStable = now - state.lastMutationAt >= domStableMs;
-      const networkQuiet = state.fetchCount === 0 && state.xhrCount === 0;
-
       const visibleSpinner = !!document.querySelector(
-        '.slds-spinner, lightning-spinner, .loading, [aria-busy="true"], [data-loading="true"]'
+        '.slds-spinner, .loading, [aria-busy="true"], lightning-spinner'
       );
 
-      return networkQuiet && domStable && !visibleSpinner;
+      const domStable = (now - state.lastChangeAt) >= domStableMs;
+
+      return domStable && !visibleSpinner;
     },
     { timeout: timeoutMs },
     { domStableMs }
   );
 
+  console.log("[waitForAppToBeReady] heuristic wait complete");
   await sleep(networkIdleMs);
-  return { mode: "heuristic" };
 }
 
 app.get("/health", (req, res) => {
