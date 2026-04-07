@@ -4,7 +4,7 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const BUILD = "SERVER_BUILD_2026_04_07_TRACE_2";
+const BUILD = "SERVER_BUILD_2026_04_07_TRACE_3";
 const PORT = process.env.PORT || 10000;
 
 function log(...args) {
@@ -93,15 +93,29 @@ async function getDiagnostics(page) {
   }
 }
 
+/**
+ * New wait strategy:
+ * 1) If preferAppReadyFlag=true, wait briefly for explicit window.CYRIL_PDF_READY=true
+ * 2) If not found, fall back to a simple fixed delay
+ *
+ * We intentionally avoid “smart” DOM-stable heuristics because they are what keep timing out.
+ */
 async function waitForReady(page, options) {
-  const timeoutMs = options.timeoutMs || 120000;
-  const domStableMs = options.waitForDomStableMs || 4000;
+  const totalTimeoutMs = options.timeoutMs || 120000;
+  const fallbackDelayMs = options.waitForDomStableMs || 4000;
   const preferFlag = options.preferAppReadyFlag === true;
 
+  // Cap the explicit-flag wait so we never burn the whole request on it.
+  const flagWaitMs = Math.min(
+    Math.max(options.flagWaitMs || 12000, 1000),
+    totalTimeoutMs
+  );
+
   log("waitForReady:start", JSON.stringify({
-    timeoutMs,
-    domStableMs,
-    preferFlag
+    totalTimeoutMs,
+    fallbackDelayMs,
+    preferFlag,
+    flagWaitMs
   }));
 
   if (preferFlag) {
@@ -109,7 +123,7 @@ async function waitForReady(page, options) {
       log("waitForReady:waiting-for-flag");
       await page.waitForFunction(
         () => window.CYRIL_PDF_READY === true,
-        { timeout: timeoutMs }
+        { timeout: flagWaitMs }
       );
       log("waitForReady:flag-detected");
       return { mode: "flag" };
@@ -118,26 +132,11 @@ async function waitForReady(page, options) {
     }
   }
 
-  log("waitForReady:waiting-for-tracker-stable");
+  log("waitForReady:fixed-delay:start", fallbackDelayMs);
+  await page.waitForTimeout(fallbackDelayMs);
+  log("waitForReady:fixed-delay:done");
 
-  await page.waitForFunction(
-    ({ domStableMs }) => {
-      const r = window.__CYRIL_RENDERER__;
-      if (!r) {
-        return false;
-      }
-
-      const noPendingNetwork = (r.fetchCount || 0) === 0 && (r.xhrCount || 0) === 0;
-      const stableForLongEnough = Date.now() - (r.lastMutationAt || 0) > domStableMs;
-
-      return noPendingNetwork && stableForLongEnough;
-    },
-    { timeout: timeoutMs },
-    { domStableMs }
-  );
-
-  log("waitForReady:tracker-stable");
-  return { mode: "tracker" };
+  return { mode: "fixed-delay" };
 }
 
 app.get("/health", (req, res) => {
@@ -164,7 +163,8 @@ app.post("/render", async (req, res) => {
       landscape: body.landscape || false,
       printBackground: body.printBackground !== false,
       preferAppReadyFlag: body.preferAppReadyFlag === true,
-      waitForDomStableMs: body.waitForDomStableMs || 4000
+      waitForDomStableMs: body.waitForDomStableMs || 4000,
+      flagWaitMs: body.flagWaitMs || 12000
     }));
 
     log("render:launching-browser");
@@ -247,7 +247,6 @@ app.post("/render", async (req, res) => {
       diagnostics: afterWaitDiagnostics,
       pdfBase64: pdf.toString("base64")
     });
-
   } catch (e) {
     const totalMs = Date.now() - startedAt;
     log("render:error", e.message, "totalMs=" + totalMs);
