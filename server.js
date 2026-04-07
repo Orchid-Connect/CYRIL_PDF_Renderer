@@ -4,16 +4,11 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const BUILD = "SERVER_BUILD_2026_04_07_FINAL";
-
+const BUILD = "SERVER_BUILD_2026_04_07_TRACE_1";
 const PORT = process.env.PORT || 10000;
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function installTracking(page) {
@@ -25,7 +20,9 @@ async function installTracking(page) {
     };
 
     const touch = () => {
-      window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+      try {
+        window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+      } catch (e) {}
     };
 
     const obs = new MutationObserver(touch);
@@ -44,6 +41,27 @@ async function installTracking(page) {
         }
       };
     }
+
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function(...args) {
+      return origOpen.apply(this, args);
+    };
+
+    XMLHttpRequest.prototype.send = function(...args) {
+      window.__CYRIL_RENDERER__.xhrCount++;
+      touch();
+
+      this.addEventListener("loadend", function() {
+        try {
+          window.__CYRIL_RENDERER__.xhrCount--;
+          touch();
+        } catch (e) {}
+      });
+
+      return origSend.apply(this, args);
+    };
   });
 }
 
@@ -52,22 +70,27 @@ async function waitForReady(page, options) {
   const domStableMs = options.waitForDomStableMs || 4000;
   const preferFlag = options.preferAppReadyFlag === true;
 
-  log("waitForReady timeout", timeoutMs);
+  log("waitForReady:start", JSON.stringify({
+    timeoutMs,
+    domStableMs,
+    preferFlag
+  }));
 
   if (preferFlag) {
     try {
+      log("waitForReady:waiting-for-flag");
       await page.waitForFunction(
         () => window.CYRIL_PDF_READY === true,
         { timeout: timeoutMs }
       );
-
-      log("CYRIL_PDF_READY detected");
+      log("waitForReady:flag-detected");
       return { mode: "flag" };
     } catch (e) {
-      log("flag not detected, fallback");
+      log("waitForReady:flag-not-detected", e.message);
     }
   }
 
+  log("waitForReady:waiting-for-dom-stable");
   await page.waitForFunction(
     ({ domStableMs }) => {
       if (!window.__CYRIL_STATE__) {
@@ -78,7 +101,7 @@ async function waitForReady(page, options) {
       }
 
       const state = window.__CYRIL_STATE__;
-      const html = document.body.innerHTML;
+      const html = document.body ? document.body.innerHTML : "";
 
       if (html !== state.lastHtml) {
         state.lastHtml = html;
@@ -91,6 +114,7 @@ async function waitForReady(page, options) {
     { domStableMs }
   );
 
+  log("waitForReady:dom-stable");
   return { mode: "heuristic" };
 }
 
@@ -103,65 +127,122 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/render", async (req, res) => {
-  const body = req.body;
+  const body = req.body || {};
   const url = body.url;
 
   let browser;
-  let page;
+
+  const startedAt = Date.now();
 
   try {
-    browser = await chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"]
-    });
+    log("render:start", JSON.stringify({
+      build: BUILD,
+      url,
+      timeoutMs: body.timeoutMs || 120000,
+      format: body.format || "A4",
+      landscape: body.landscape || false,
+      printBackground: body.printBackground !== false,
+      preferAppReadyFlag: body.preferAppReadyFlag === true,
+      waitForDomStableMs: body.waitForDomStableMs || 4000
+    }));
 
+    log("render:launching-browser");
+    browser = await chromium.launch({
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      headless: true
+    });
+    log("render:browser-launched");
+
+    log("render:creating-context");
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,
       viewport: { width: 1440, height: 2200 }
     });
+    log("render:context-created");
 
-    page = await context.newPage();
+    log("render:creating-page");
+    const page = await context.newPage();
+    log("render:page-created");
 
-    // ***** THIS IS THE CRITICAL FIX *****
     page.setDefaultTimeout(body.timeoutMs || 120000);
     page.setDefaultNavigationTimeout(body.timeoutMs || 120000);
 
-    await installTracking(page);
-
     page.on("console", msg => {
-      log("browser:", msg.text());
+      log("browser:console", msg.type(), msg.text());
     });
 
+    page.on("pageerror", err => {
+      log("browser:pageerror", err.message);
+    });
+
+    page.on("requestfailed", request => {
+      const failure = request.failure();
+      log("browser:requestfailed", request.url(), failure ? failure.errorText : "unknown");
+    });
+
+    log("render:install-tracking");
+    await installTracking(page);
+    log("render:tracking-installed");
+
+    log("render:goto:start", url);
     await page.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: body.timeoutMs || 120000
     });
+    log("render:goto:done");
+
+    try {
+      const title = await page.title();
+      log("render:page-title", title);
+    } catch (e) {
+      log("render:page-title:error", e.message);
+    }
 
     const waitResult = await waitForReady(page, body);
+    log("render:wait-complete", waitResult.mode);
 
+    log("render:pdf:start");
     const pdf = await page.pdf({
       format: body.format || "A4",
       landscape: body.landscape || false,
       printBackground: body.printBackground !== false
     });
+    log("render:pdf:done", "bytes=" + pdf.length);
 
-    res.json({
+    const totalMs = Date.now() - startedAt;
+    log("render:success", "totalMs=" + totalMs);
+
+    return res.json({
       success: true,
       build: BUILD,
       waitMode: waitResult.mode,
+      totalMs,
       pdfBase64: pdf.toString("base64")
     });
 
   } catch (e) {
-    res.status(500).json({
+    const totalMs = Date.now() - startedAt;
+    log("render:error", e.message, "totalMs=" + totalMs);
+
+    return res.status(500).json({
       success: false,
       build: BUILD,
+      totalMs,
       message: e.message
     });
   } finally {
-    if (browser) await browser.close();
+    if (browser) {
+      try {
+        log("render:browser:closing");
+        await browser.close();
+        log("render:browser:closed");
+      } catch (closeErr) {
+        log("render:browser:close-error", closeErr.message);
+      }
+    }
   }
 });
 
 app.listen(PORT, () => {
-  log("Renderer started", BUILD);
+  log("Renderer started", BUILD, "PORT=" + PORT);
 });
