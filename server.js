@@ -16,7 +16,9 @@ const DEFAULT_VIEWPORT_HEIGHT = Number(process.env.DEFAULT_VIEWPORT_HEIGHT || 22
 const LOG_BROWSER_CONSOLE = (process.env.LOG_BROWSER_CONSOLE || "true").toLowerCase() === "true";
 const LOG_REQUESTS = (process.env.LOG_REQUESTS || "true").toLowerCase() === "true";
 const BLOCK_MEDIA = (process.env.BLOCK_MEDIA || "false").toLowerCase() === "true";
-const USER_AGENT = process.env.USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const USER_AGENT =
+  process.env.USER_AGENT ||
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -37,7 +39,7 @@ function assertAuthorized(req, res) {
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function toBoolean(value, fallback) {
@@ -69,20 +71,26 @@ async function installTracking(page) {
     function ensureMutationObserver() {
       if (window.__CYRIL_RENDERER__.mutationObserverInstalled) return;
       window.__CYRIL_RENDERER__.mutationObserverInstalled = true;
+
       const observer = new MutationObserver(() => {
         window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
       });
-      observer.observe(document.documentElement || document, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        characterData: true
-      });
+
+      const target = document.documentElement || document;
+      if (target) {
+        observer.observe(target, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true
+        });
+      }
     }
 
     function ensureFetchWrap() {
       if (window.__CYRIL_RENDERER__.fetchInstalled || !window.fetch) return;
       window.__CYRIL_RENDERER__.fetchInstalled = true;
+
       const originalFetch = window.fetch.bind(window);
       window.fetch = async (...args) => {
         window.__CYRIL_RENDERER__.fetchCount++;
@@ -99,22 +107,28 @@ async function installTracking(page) {
     function ensureXhrWrap() {
       if (window.__CYRIL_RENDERER__.xhrInstalled || !window.XMLHttpRequest) return;
       window.__CYRIL_RENDERER__.xhrInstalled = true;
+
       const originalOpen = XMLHttpRequest.prototype.open;
       const originalSend = XMLHttpRequest.prototype.send;
 
-      XMLHttpRequest.prototype.open = function(...args) {
+      XMLHttpRequest.prototype.open = function (...args) {
         this.__cyrilTracked = true;
         return originalOpen.apply(this, args);
       };
 
-      XMLHttpRequest.prototype.send = function(...args) {
+      XMLHttpRequest.prototype.send = function (...args) {
         if (this.__cyrilTracked) {
           window.__CYRIL_RENDERER__.xhrCount++;
           window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
-          this.addEventListener("loadend", () => {
-            window.__CYRIL_RENDERER__.xhrCount--;
-            window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
-          }, { once: true });
+
+          this.addEventListener(
+            "loadend",
+            () => {
+              window.__CYRIL_RENDERER__.xhrCount--;
+              window.__CYRIL_RENDERER__.lastMutationAt = Date.now();
+            },
+            { once: true }
+          );
         }
         return originalSend.apply(this, args);
       };
@@ -138,36 +152,75 @@ async function waitForFonts(page) {
   }
 }
 
-async function waitForAppToBeReady(page, options) {
-  const timeoutMs = Number(options.timeoutMs || 120000);
-  const networkIdleMs = Number(options.waitForNetworkIdleMs || 1500);
-  const domStableMs = Number(options.waitForDomStableMs || 1500);
-  const preferAppReadyFlag = options.preferAppReadyFlag === true;
+async function getReadyDiagnostics(page) {
+  try {
+    return await page.evaluate(() => {
+      const rendererState = window.__CYRIL_RENDERER__ || {};
+      return {
+        mode: null,
+        readyFlag: window.CYRIL_PDF_READY === true,
+        bodyReadyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
+        pending:
+          window.CYRIL_PDF_TRACKER && typeof window.CYRIL_PDF_TRACKER.getPending === "function"
+            ? window.CYRIL_PDF_TRACKER.getPending()
+            : null,
+        fetchCount: rendererState.fetchCount || 0,
+        xhrCount: rendererState.xhrCount || 0,
+        title: document.title || null,
+        href: window.location ? window.location.href : null
+      };
+    });
+  } catch (e) {
+    return {
+      mode: null,
+      readyFlag: false,
+      bodyReadyAttr: null,
+      pending: null,
+      fetchCount: 0,
+      xhrCount: 0,
+      title: null,
+      href: null,
+      diagnosticsError: e && e.message ? e.message : String(e)
+    };
+  }
+}
 
-  console.log("[waitForAppToBeReady] timeoutMs =", timeoutMs);
-  console.log("[waitForAppToBeReady] preferAppReadyFlag =", preferAppReadyFlag);
+async function waitForAppToBeReady(page, options) {
+  const timeoutMs = getSafeNumber(options.timeoutMs, DEFAULT_TIMEOUT_MS, 1000, 300000);
+  const networkIdleMs = getSafeNumber(
+    options.waitForNetworkIdleMs,
+    DEFAULT_WAIT_FOR_NETWORK_IDLE_MS,
+    0,
+    60000
+  );
+  const domStableMs = getSafeNumber(
+    options.waitForDomStableMs,
+    DEFAULT_WAIT_FOR_DOM_STABLE_MS,
+    0,
+    60000
+  );
+  const preferAppReadyFlag = toBoolean(options.preferAppReadyFlag, true);
+
+  log("[waitForAppToBeReady] timeoutMs =", timeoutMs);
+  log("[waitForAppToBeReady] networkIdleMs =", networkIdleMs);
+  log("[waitForAppToBeReady] domStableMs =", domStableMs);
+  log("[waitForAppToBeReady] preferAppReadyFlag =", preferAppReadyFlag);
 
   await page.waitForLoadState("domcontentloaded", { timeout: timeoutMs });
   await page.waitForLoadState("load", { timeout: timeoutMs });
 
   try {
     await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 30000) });
-    console.log("[waitForAppToBeReady] networkidle reached");
+    log("[waitForAppToBeReady] networkidle reached");
   } catch (e) {
-    console.log("[waitForAppToBeReady] networkidle not reached, continuing");
+    log("[waitForAppToBeReady] networkidle not reached, continuing");
   }
 
-  await page.evaluate(async () => {
-    if (document.fonts && document.fonts.ready) {
-      try {
-        await document.fonts.ready;
-      } catch (e) {}
-    }
-  });
+  await waitForFonts(page);
 
   if (preferAppReadyFlag) {
     try {
-      console.log("[waitForAppToBeReady] waiting for window.CYRIL_PDF_READY === true");
+      log("[waitForAppToBeReady] waiting for window.CYRIL_PDF_READY === true");
 
       await page.waitForFunction(
         () => {
@@ -176,23 +229,17 @@ async function waitForAppToBeReady(page, options) {
         { timeout: Math.min(timeoutMs, 120000) }
       );
 
-      console.log("[waitForAppToBeReady] CYRIL_PDF_READY detected");
+      await sleep(networkIdleMs);
 
-      const readyState = await page.evaluate(() => {
-        return {
-          mode: "appReadyFlag",
-          ready: window.CYRIL_PDF_READY === true,
-          bodyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
-          pending: window.CYRIL_PDF_TRACKER && window.CYRIL_PDF_TRACKER.getPending
-            ? window.CYRIL_PDF_TRACKER.getPending()
-            : null
-        };
-      });
-
-      console.log("[waitForAppToBeReady] ready state", JSON.stringify(readyState));
-      return readyState;
+      const diagnostics = await getReadyDiagnostics(page);
+      diagnostics.mode = "appReadyFlag";
+      log("[waitForAppToBeReady] appReadyFlag diagnostics", JSON.stringify(diagnostics));
+      return diagnostics;
     } catch (e) {
-      console.log("[waitForAppToBeReady] CYRIL_PDF_READY not detected, falling back to heuristic wait");
+      log(
+        "[waitForAppToBeReady] CYRIL_PDF_READY not detected, falling back to heuristic wait:",
+        e && e.message ? e.message : String(e)
+      );
     }
   }
 
@@ -218,7 +265,7 @@ async function waitForAppToBeReady(page, options) {
         '.slds-spinner, .loading, [aria-busy="true"], lightning-spinner'
       );
 
-      const domStable = (now - state.lastChangeAt) >= domStableMs;
+      const domStable = now - state.lastChangeAt >= domStableMs;
 
       return domStable && !visibleSpinner;
     },
@@ -226,22 +273,12 @@ async function waitForAppToBeReady(page, options) {
     { domStableMs }
   );
 
-  console.log("[waitForAppToBeReady] heuristic wait complete");
   await sleep(networkIdleMs);
 
-  const readyState = await page.evaluate(() => {
-    return {
-      mode: "heuristic",
-      ready: window.CYRIL_PDF_READY === true,
-      bodyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
-      pending: window.CYRIL_PDF_TRACKER && window.CYRIL_PDF_TRACKER.getPending
-        ? window.CYRIL_PDF_TRACKER.getPending()
-        : null
-    };
-  });
-
-  console.log("[waitForAppToBeReady] ready state", JSON.stringify(readyState));
-  return readyState;
+  const diagnostics = await getReadyDiagnostics(page);
+  diagnostics.mode = "heuristic";
+  log("[waitForAppToBeReady] heuristic diagnostics", JSON.stringify(diagnostics));
+  return diagnostics;
 }
 
 app.get("/health", (req, res) => {
@@ -267,23 +304,25 @@ app.post("/render", async (req, res) => {
   let page;
 
   try {
+    const effectiveTimeoutMs = getSafeNumber(body.timeoutMs, DEFAULT_TIMEOUT_MS, 1000, 300000);
+    const effectivePreferAppReadyFlag = toBoolean(body.preferAppReadyFlag, true);
+
     if (LOG_REQUESTS) {
-      log("/render request", JSON.stringify({
-        url: targetUrl,
-        format: body.format || "A4",
-        landscape: !!body.landscape,
-        timeoutMs: getSafeNumber(body.timeoutMs, DEFAULT_TIMEOUT_MS),
-        preferAppReadyFlag: toBoolean(body.preferAppReadyFlag, true)
-      }));
+      log(
+        "/render request",
+        JSON.stringify({
+          url: targetUrl,
+          format: body.format || "A4",
+          landscape: !!body.landscape,
+          timeoutMs: effectiveTimeoutMs,
+          preferAppReadyFlag: effectivePreferAppReadyFlag
+        })
+      );
     }
 
     browser = await chromium.launch({
       headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
     });
 
     context = await browser.newContext({
@@ -296,9 +335,9 @@ app.post("/render", async (req, res) => {
     });
 
     if (BLOCK_MEDIA) {
-      await context.route("**/*", async route => {
-        const req = route.request();
-        const type = req.resourceType();
+      await context.route("**/*", async (route) => {
+        const request = route.request();
+        const type = request.resourceType();
         if (["media"].includes(type)) {
           return route.abort();
         }
@@ -310,25 +349,26 @@ app.post("/render", async (req, res) => {
     await installTracking(page);
 
     if (LOG_BROWSER_CONSOLE) {
-      page.on("console", msg => {
+      page.on("console", (msg) => {
         log("[browser console]", msg.type(), msg.text());
       });
     }
 
-    page.on("pageerror", err => {
+    page.on("pageerror", (err) => {
       errorLog("[page error]", err && err.stack ? err.stack : String(err));
     });
 
-    page.on("requestfailed", request => {
+    page.on("requestfailed", (request) => {
       errorLog("[request failed]", request.failure()?.errorText, request.url());
     });
 
     await page.goto(targetUrl, {
       waitUntil: "domcontentloaded",
-      timeout: getSafeNumber(body.timeoutMs, DEFAULT_TIMEOUT_MS, 1000, 300000)
+      timeout: effectiveTimeoutMs
     });
 
     const waitResult = await waitForAppToBeReady(page, body);
+    log("[render wait result]", JSON.stringify(waitResult));
 
     const pdfBuffer = await page.pdf({
       format: body.format || "A4",
@@ -343,23 +383,14 @@ app.post("/render", async (req, res) => {
       }
     });
 
-    const diagnostics = await page.evaluate(() => {
-      const state = window.__CYRIL_RENDERER__ || {};
-      return {
-        readyFlag: window.CYRIL_PDF_READY === true,
-        fetchCount: state.fetchCount || 0,
-        xhrCount: state.xhrCount || 0,
-        bodyReadyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null,
-        title: document.title || null
-      };
-    });
+    const diagnostics = await getReadyDiagnostics(page);
 
     return res.json({
       success: true,
       message: "Rendered successfully",
       pdfBase64: pdfBuffer.toString("base64"),
       pageCount: null,
-      waitMode: waitResult.mode,
+      waitMode: waitResult ? waitResult.mode : null,
       diagnostics
     });
   } catch (e) {
