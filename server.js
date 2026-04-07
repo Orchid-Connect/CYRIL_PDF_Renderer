@@ -4,7 +4,7 @@ const { chromium } = require("playwright");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-const BUILD = "SERVER_BUILD_2026_04_07_TRACE_1";
+const BUILD = "SERVER_BUILD_2026_04_07_TRACE_2";
 const PORT = process.env.PORT || 10000;
 
 function log(...args) {
@@ -25,8 +25,16 @@ async function installTracking(page) {
       } catch (e) {}
     };
 
-    const obs = new MutationObserver(touch);
-    obs.observe(document, { childList: true, subtree: true, attributes: true });
+    const obs = new MutationObserver(() => {
+      touch();
+    });
+
+    obs.observe(document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true
+    });
 
     const origFetch = window.fetch;
     if (origFetch) {
@@ -65,6 +73,26 @@ async function installTracking(page) {
   });
 }
 
+async function getDiagnostics(page) {
+  try {
+    return await page.evaluate(() => {
+      const r = window.__CYRIL_RENDERER__ || {};
+      return {
+        readyFlag: window.CYRIL_PDF_READY === true,
+        fetchCount: r.fetchCount || 0,
+        xhrCount: r.xhrCount || 0,
+        lastMutationAt: r.lastMutationAt || null,
+        title: document.title || "",
+        bodyReadyAttr: document.body ? document.body.getAttribute("data-cyril-pdf-ready") : null
+      };
+    });
+  } catch (e) {
+    return {
+      diagnosticsError: e.message
+    };
+  }
+}
+
 async function waitForReady(page, options) {
   const timeoutMs = options.timeoutMs || 120000;
   const domStableMs = options.waitForDomStableMs || 4000;
@@ -90,32 +118,26 @@ async function waitForReady(page, options) {
     }
   }
 
-  log("waitForReady:waiting-for-dom-stable");
+  log("waitForReady:waiting-for-tracker-stable");
+
   await page.waitForFunction(
     ({ domStableMs }) => {
-      if (!window.__CYRIL_STATE__) {
-        window.__CYRIL_STATE__ = {
-          lastHtml: "",
-          lastChange: Date.now()
-        };
+      const r = window.__CYRIL_RENDERER__;
+      if (!r) {
+        return false;
       }
 
-      const state = window.__CYRIL_STATE__;
-      const html = document.body ? document.body.innerHTML : "";
+      const noPendingNetwork = (r.fetchCount || 0) === 0 && (r.xhrCount || 0) === 0;
+      const stableForLongEnough = Date.now() - (r.lastMutationAt || 0) > domStableMs;
 
-      if (html !== state.lastHtml) {
-        state.lastHtml = html;
-        state.lastChange = Date.now();
-      }
-
-      return Date.now() - state.lastChange > domStableMs;
+      return noPendingNetwork && stableForLongEnough;
     },
     { timeout: timeoutMs },
     { domStableMs }
   );
 
-  log("waitForReady:dom-stable");
-  return { mode: "heuristic" };
+  log("waitForReady:tracker-stable");
+  return { mode: "tracker" };
 }
 
 app.get("/health", (req, res) => {
@@ -131,7 +153,6 @@ app.post("/render", async (req, res) => {
   const url = body.url;
 
   let browser;
-
   const startedAt = Date.now();
 
   try {
@@ -198,8 +219,14 @@ app.post("/render", async (req, res) => {
       log("render:page-title:error", e.message);
     }
 
+    const beforeWaitDiagnostics = await getDiagnostics(page);
+    log("render:diagnostics:before-wait", JSON.stringify(beforeWaitDiagnostics));
+
     const waitResult = await waitForReady(page, body);
     log("render:wait-complete", waitResult.mode);
+
+    const afterWaitDiagnostics = await getDiagnostics(page);
+    log("render:diagnostics:after-wait", JSON.stringify(afterWaitDiagnostics));
 
     log("render:pdf:start");
     const pdf = await page.pdf({
@@ -217,6 +244,7 @@ app.post("/render", async (req, res) => {
       build: BUILD,
       waitMode: waitResult.mode,
       totalMs,
+      diagnostics: afterWaitDiagnostics,
       pdfBase64: pdf.toString("base64")
     });
 
